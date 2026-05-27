@@ -1,0 +1,233 @@
+# -*- coding: gbk -*-
+
+_ACCOUNT_ID = ""
+account = ""
+_done = False
+
+REDIS_HOST = "127.0.0.1"
+REDIS_PORT = 6379
+REDIS_PASSWORD = ""
+REDIS_DB = 0
+REDIS_QUEUE_KEY = "qmt:position_pct"  # 与 查询持仓占比.py 相同，固定公共 key
+REDIS_ENCODE_BASE64 = True
+
+# 调仓：|本户% - Redis%| > 阈值 时 order_percent 下单
+ENABLE_REBALANCE = True
+REBALANCE_THRESHOLD = 0.5   # 单位：百分点，如 0.5 表示 0.5%
+ORDER_STYLE = "LATEST"      # LATEST / COMPETE / FIX / HANG / MARKET 等
+ORDER_FIX_PRICE = 0.0
+#账户比例
+FOLLOW_ORDER_SCALE = 0.25
+AUTO_FOLLOW_SCALE = False
+FOLLOW_CAPITAL =0
+
+
+def _redis_client():
+    import redis
+    return redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        password=REDIS_PASSWORD or None,
+        db=REDIS_DB,
+        decode_responses=True,
+    )
+
+
+def _decode_payload(raw):
+    import base64
+    if raw is None:
+        return u""
+    s = raw if isinstance(raw, type(u"")) else str(raw)
+    s = s.strip()
+    if not s:
+        return u""
+    if REDIS_ENCODE_BASE64:
+        try:
+            b = base64.b64decode(s)
+            return b.decode("utf-8", "ignore")
+        except Exception:
+            pass
+    return s
+
+
+def _load_redis_queue():
+    """读公共队列，与当前登录账号无关。"""
+    out = {}
+    key = REDIS_QUEUE_KEY
+    try:
+        r = _redis_client()
+        r.ping()
+    except ImportError:
+        print(u"未安装 redis")
+        return out
+    except Exception as e:
+        print(u"Redis 连接失败:", e)
+        return out
+
+    try:
+        raw = r.get(key)
+    except Exception as e:
+        print(u"Redis GET 失败:", key, e)
+        return out
+
+    text = _decode_payload(raw)
+    lines = [x.strip() for x in text.replace("\r", "").split("\n") if x.strip()]
+    print(u"读取公共队列", key, u"条数=", len(lines))
+
+    for line in lines:
+        if line.startswith("["):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 6:
+            continue
+        try:
+            code = parts[0].strip().upper()
+            name = parts[1].strip()
+            pct = float(parts[5].strip().replace("%", ""))
+            out[code] = (name, pct)
+        except Exception:
+            continue
+    return out
+
+
+def _load_local_position_pct(acc):
+    total = 0.0
+    for t in ("STOCK", "HUGANGTONG", "SHENGANGTONG"):
+        try:
+            for a in get_trade_detail_data(acc, t, "ACCOUNT") or []:
+                b = float(getattr(a, "m_dBalance", 0) or 0)
+                if b > total:
+                    total = b
+        except Exception:
+            pass
+    if total <= 0:
+        return total, {}
+
+    seen = set()
+    local = {}
+    for t in ("STOCK", "HUGANGTONG", "SHENGANGTONG"):
+        try:
+            for p in get_trade_detail_data(acc, t, "POSITION") or []:
+                code = str(getattr(p, "m_strInstrumentID", "") or "").strip()
+                ex = str(getattr(p, "m_strExchangeID", "") or "").strip()
+                if code and ex and "." not in code:
+                    code = code + "." + ex
+                k = code.upper()
+                if not k or k in seen:
+                    continue
+                seen.add(k)
+                vol = int(float(getattr(p, "m_nVolume", 0) or 0))
+                price = float(getattr(p, "m_dSettlementPrice", 0) or 0)
+                if vol <= 0 or price <= 0:
+                    continue
+                mv = vol * price
+                pct = mv / total * 100.0
+                name = str(getattr(p, "m_strInstrumentName", "") or "")
+                local[k] = (name, pct)
+        except Exception:
+            pass
+    return total, local
+
+
+def _order_percent_adjust(code, order_frac, acc, ContextInfo):
+    """
+    order_frac：占总资产比例，正=买入、负=卖出。
+    例：本户 5.5%、Redis 4%，差 +1.5% -> order_frac=-0.015 减仓。
+    """
+    style = str(ORDER_STYLE or "LATEST").strip()
+    try:
+        if style.upper() == "FIX" and float(ORDER_FIX_PRICE) > 0:
+            return order_percent(code, order_frac, "FIX", float(ORDER_FIX_PRICE), ContextInfo, acc)
+        if style.upper() == "LATEST":
+            try:
+                return order_percent(code, order_frac, ContextInfo, acc)
+            except TypeError:
+                return order_percent(code, order_frac, "LATEST", ContextInfo, acc)
+        return order_percent(code, order_frac, style, ContextInfo, acc)
+    except TypeError:
+        return order_percent(code, order_frac, style, float(ORDER_FIX_PRICE), ContextInfo, acc)
+    except Exception as e:
+        print(u"order_percent 失败", code, order_frac, e)
+        return None
+
+
+def _follow_order_scale(total_balance):
+    if AUTO_FOLLOW_SCALE and float(FOLLOW_CAPITAL) > 0 and float(total_balance) > 0:
+        return float(FOLLOW_CAPITAL) / float(total_balance)
+    s = float(FOLLOW_ORDER_SCALE)
+    if s < 0:
+        s = 0.0
+    return s
+
+
+def _rebalance_by_diff(redis_map, local_map, acc, ContextInfo, total_balance):
+    if not ENABLE_REBALANCE:
+        return 0
+    scale = _follow_order_scale(total_balance)
+    print(u"跟单下单系数 scale=", round(scale, 6), u"(order_percent 乘此系数)")
+    n = 0
+    for code, (r_name, redis_pct) in redis_map.items():
+        local_pct = local_map.get(code, (r_name, 0.0))[1]
+        diff = local_pct - redis_pct
+        if abs(diff) <= float(REBALANCE_THRESHOLD):
+            continue
+        order_frac_raw = (redis_pct - local_pct) / 100.0
+        order_frac = order_frac_raw * scale
+        if abs(order_frac) < 1e-6:
+            continue
+        side = u"买" if order_frac > 0 else u"卖"
+        print(
+            u"调仓", code, side,
+            u"理论", round(order_frac_raw, 6),
+            u"实际", round(order_frac, 6),
+            u"本户%", round(local_pct, 2),
+            u"Redis%", round(redis_pct, 2),
+            u"差", round(diff, 2)
+        )
+        _order_percent_adjust(code, order_frac, acc, ContextInfo)
+        n += 1
+    return n
+
+
+def init(ContextInfo):
+    print(u"对比 Redis 持仓差 init，读 key=", REDIS_QUEUE_KEY)
+
+
+def handlebar(ContextInfo):
+    global _done
+    if not ContextInfo.is_last_bar() or _done:
+        return
+
+    acc = str(_ACCOUNT_ID or getattr(ContextInfo, "accid", "") or account or "").strip()
+    if not acc:
+        print(u"未指定本户资金账号(用于查持仓)")
+        return
+
+    redis_map = _load_redis_queue()
+    if not redis_map:
+        print(u"公共队列无数据，请先在推送账户运行 查询持仓占比.py")
+        return
+
+    total, local_map = _load_local_position_pct(acc)
+    if total <= 0:
+        print(u"本户总资产为 0")
+        return
+
+    print(u"本户账号", acc, u"总资产", round(total, 2))
+    print(u"代码\t名称\tRedis%\t本户%\t差值(本户-Redis)")
+    rows = []
+    for code, (r_name, redis_pct) in redis_map.items():
+        if code in local_map:
+            name, local_pct = local_map[code]
+        else:
+            name, local_pct = r_name, 0.0
+        rows.append((abs(local_pct - redis_pct), code, name, redis_pct, local_pct))
+    rows.sort(key=lambda x: -x[0])
+    for _, code, name, redis_pct, local_pct in rows:
+        print(u"%s\t%s\t%.2f%%\t%.2f%%\t%+.2f%%" % (
+            code, name, redis_pct, local_pct, local_pct - redis_pct))
+    print(u"对比", len(rows), u"只")
+    n_order = _rebalance_by_diff(redis_map, local_map, acc, ContextInfo, total)
+    if ENABLE_REBALANCE:
+        print(u"触发调仓笔数(|差值|>", REBALANCE_THRESHOLD, u"%):", n_order)
+    _done = True
